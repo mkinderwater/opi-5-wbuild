@@ -1,0 +1,70 @@
+#!/usr/bin/python3
+"""Explicit Docker functional test. Pulls a pinned ARM64 image and creates temporary resources."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+import urllib.request
+import uuid
+
+INPUT=Path('/usr/local/lib/chatbox/container-test-input.json')
+def main():
+    if os.geteuid()!=0:raise SystemExit('Run as root on the Orange Pi.')
+    image=json.loads(INPUT.read_text())['image']
+    prefix='chatbox-test-'+uuid.uuid4().hex[:12]
+    net=None;volume=None;containers=[]
+    def run(*args,timeout=90):
+        return subprocess.run(['docker',*args],check=True,capture_output=True,text=True,timeout=timeout).stdout.strip()
+    def create(*args):
+        cid=run('create',*args);containers.append(cid);return cid
+    try:
+        info=json.loads(run('info','--format','{{json .}}'))
+        if info.get('Driver')!='overlay2':raise RuntimeError('Expected overlay2 storage driver, got '+str(info.get('Driver')))
+        if str(info.get('CgroupVersion'))!='2':raise RuntimeError('Expected cgroup v2')
+        run('pull','--platform','linux/arm64',image,timeout=600)
+        net=run('network','create',prefix)
+        volume=run('volume','create',prefix)
+        token=prefix+'-passed'
+        server=create('--name',prefix+'-server','--network',net,'--memory','64m','--pids-limit','64',
+            '--cpus','0.5','--security-opt','no-new-privileges:true',
+            '--mount','type=volume,src='+volume+',dst=/data','-p','127.0.0.1::8080',image,
+            'sh','-ec','mkdir /www; echo '+token+' >/www/index.html; echo '+token+' >/data/proof; exec httpd -f -p 8080 -h /www')
+        run('start',server)
+        inspect=json.loads(run('inspect',server))[0]
+        port=inspect['NetworkSettings']['Ports']['8080/tcp'][0]['HostPort']
+        for attempt in range(30):
+            try:
+                with urllib.request.urlopen('http://127.0.0.1:'+port,timeout=2) as r:
+                    if r.read().decode().strip()!=token:raise RuntimeError('Unexpected HTTP body')
+                break
+            except OSError:
+                if attempt==29:raise
+                time.sleep(.2)
+        limits=run('exec',server,'sh','-ec',
+            'test "$(cat /sys/fs/cgroup/memory.max)" = 67108864; '
+            'test "$(cat /sys/fs/cgroup/pids.max)" = 64; '
+            'test "$(cat /sys/fs/cgroup/cpu.max)" = "50000 100000"; '
+            'grep -q "^Seccomp:[[:space:]]*2" /proc/self/status; '
+            'awk \'$2=="/" && $3=="overlay" {ok=1} END {exit !ok}\' /proc/mounts; echo limits-and-overlay-pass')
+        reader=create('--network',net,'--mount','type=volume,src='+volume+',dst=/data',image,
+            'sh','-ec','test "$(cat /data/proof)" = '+token+'; '
+            'test "$(wget -qO- http://'+prefix+'-server:8080/)" = '+token+'; echo persistence-and-dns-pass')
+        run('start','--attach',reader)
+        code=int(run('inspect','--format','{{.State.ExitCode}}',reader))
+        if code:raise RuntimeError('Reader container failed: '+str(code))
+    finally:
+        cleanup=[]
+        for cid in reversed(containers):
+            if subprocess.run(['docker','rm','-f',cid],stdout=subprocess.DEVNULL).returncode:cleanup.append('container '+cid)
+        if net and subprocess.run(['docker','network','rm',net],stdout=subprocess.DEVNULL).returncode:cleanup.append('network '+net)
+        if volume and subprocess.run(['docker','volume','rm',volume],stdout=subprocess.DEVNULL).returncode:cleanup.append('volume '+volume)
+        if cleanup:raise RuntimeError('Cleanup incomplete: '+', '.join(cleanup))
+    print('PASS: overlay2 rootfs, named-volume persistence, bridge/veth/container DNS, published localhost port, cgroup v2 CPU/memory/PID limits and seccomp.')
+    print('Image:',image)
+    print('No NPU inference, external internet NAT egress or reboot test was performed.')
+if __name__=='__main__':
+    try:main()
+    except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as error:
+        print('FAIL:',error,file=sys.stderr);raise SystemExit(1)

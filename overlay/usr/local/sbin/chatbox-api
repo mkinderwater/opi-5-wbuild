@@ -1,0 +1,43 @@
+#!/usr/bin/python3
+"""CLI for the local coordinator; no curl or third-party packages required."""
+import argparse
+import http.client
+import json
+import sys
+
+
+def main(argv=None,port=8088):
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('action',choices=['health','ready','diagnostics','chat'])
+    parser.add_argument('message',nargs='?');parser.add_argument('--stream',action='store_true')
+    args=parser.parse_args(argv)
+    if args.action=='chat' and not args.message:parser.error('chat requires a message')
+    connection=http.client.HTTPConnection('127.0.0.1',port,timeout=65)
+    try:
+        payload={'messages':[{'role':'user','content':args.message}],'stream':args.stream} if args.action=='chat' else None
+        connection.request('POST' if payload else 'GET','/v1/chat/completions' if payload else '/'+args.action,
+                           body=json.dumps(payload) if payload else None,headers={'Content-Type':'application/json'})
+        response=connection.getresponse()
+        if response.status!=200:
+            print(response.read(65536).decode(errors='replace'),file=sys.stderr);return 1
+        if args.action=='chat' and args.stream:
+            for line in response:
+                if not line.startswith(b'data:'):continue
+                text=line[5:].strip()
+                if text==b'[DONE]':break
+                data=json.loads(text)
+                if 'error' in data:print(data['error'],file=sys.stderr);return 1
+                choices=data.get('choices') or []
+                if not choices:continue  # Some engines emit a final usage-only chunk.
+                value=choices[0].get('delta',{}).get('content','') or ''
+                if not isinstance(value,str):raise ValueError('Invalid streamed text')
+                print(value,end='',flush=True)
+            print();return 0
+        data=json.loads(response.read(1048577))
+        print(data['choices'][0]['message']['content'] if args.action=='chat' else json.dumps(data,indent=2))
+        return 0
+    except (OSError,http.client.HTTPException,ValueError,KeyError,IndexError,TypeError) as error:
+        print('Coordinator request failed: '+type(error).__name__,file=sys.stderr);return 1
+    finally:connection.close()
+
+if __name__=='__main__':raise SystemExit(main())

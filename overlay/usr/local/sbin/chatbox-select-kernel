@@ -1,0 +1,35 @@
+#!/bin/bash
+set -euo pipefail
+choice=${1:-}
+case "$choice" in display|recovery) ;; *) echo 'Usage: chatbox-select-kernel display|recovery'; exit 2;; esac
+abi=$(cat /etc/chatbox/kernel-abi)
+[[ "$abi" =~ ^[0-9A-Za-z.+_-]+$ ]] || exit 1
+root_id=$(sed -n 's/^ROOT_PARTUUID=//p' /etc/chatbox/platform.conf)
+[[ "$root_id" =~ ^[0-9a-f]{8}-02$ ]] || exit 1
+base=6.12.113+deb13-arm64
+# The boot DTB is copied from the matching installed kernel package.
+dtb=/boot/chatbox-orangepi-5.dtb
+for file in "/boot/vmlinuz-$base" "/boot/initrd.img-$base" /boot/chatbox-recovery.dtb; do
+    [ -s "$file" ] || { echo "Missing recovery boot component: $file"; exit 1; }
+done
+if [ "$choice" = display ]; then
+    for file in "/boot/vmlinuz-$abi" "/boot/initrd.img-$abi" "$dtb"; do
+        [ -s "$file" ] || { echo "Missing display boot component: $file"; exit 1; }
+    done
+    # Built-in drivers need no .ko; modular drivers must be in the initramfs.
+    listing=$(mktemp)
+    trap 'rm -f "$listing"' EXIT
+    lsinitramfs "/boot/initrd.img-$abi" >"$listing"
+    # shellcheck source=/dev/null
+    source /usr/local/lib/chatbox/kernel.sh
+    validate_root_drivers "/boot/config-$abi" "$listing"
+fi
+config=/boot/extlinux/extlinux.conf
+next=/boot/extlinux/extlinux.conf.new
+# shellcheck source=/dev/null
+source /usr/local/lib/chatbox/boot-menu.sh
+render_boot_menu "$choice" "$abi" "$root_id" >"$next"
+sync
+mv -f "$next" "$config"
+sync
+printf 'Next boot: %s\n' "$choice"

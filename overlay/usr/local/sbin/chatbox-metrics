@@ -1,0 +1,6 @@
+#!/usr/bin/python3
+import json
+import sys
+sys.path.insert(0,'/usr/local/lib/chatbox')
+from coordinator import diagnostics
+print(json.dumps(diagnostics(),indent=2))

@@ -1,0 +1,282 @@
+#!/usr/bin/python3
+"""Read-only Chatbox inventory and state checks; optional OpenCL computation."""
+import argparse
+import http.client
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, '/usr/local/lib/chatbox')
+import board_report
+from coordinator import Backend, Deadline, load_config, upstream
+from acceptance import finish, vet_baseline
+import containers as container_checks
+
+
+def probe(endpoint):
+    try:
+        with upstream(Backend('coordinator', 'http://127.0.0.1:8088', ''),
+                      endpoint, None, Deadline(3)) as response:
+            raw = response.read(16385)
+            if len(raw) > 16384:
+                return {'error': 'oversized_reply'}
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                return {'error': 'invalid_reply'}
+            # Do not echo model names, URLs, exception text or unknown fields.
+            state = data.get('state')
+            return {'http_status': response.status,
+                    'ok': data.get('ok') is True,
+                    'ready': data.get('ready') is True,
+                    'state': state if state in ('ready', 'loading', 'unconfigured') else 'unknown'}
+    except (OSError, http.client.HTTPException, ValueError):
+        return {'error': 'unavailable'}
+
+
+def compute():
+    try:
+        result = subprocess.run(['/usr/local/sbin/chatbox-opencl-check'],
+                                capture_output=True, text=True, timeout=65,
+                                env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LC_ALL': 'C', 'RUSTICL_ENABLE':'panfrost'})
+        passed = result.returncode == 0 and 'PASS' in result.stdout
+        return 'pass' if passed else 'fail'
+    except subprocess.TimeoutExpired:
+        return 'timeout'
+    except OSError:
+        return 'unavailable'
+
+
+def compute_vulkan():
+    try:
+        result=subprocess.run(['/usr/local/sbin/chatbox-vulkan-check'],capture_output=True,text=True,timeout=65)
+        return 'pass' if result.returncode==0 and 'PASS' in result.stdout else 'fail'
+    except subprocess.TimeoutExpired:return 'timeout'
+    except OSError:return 'unavailable'
+
+
+def collect(root=Path('/'), snapshot=None, query=probe, run_compute=None, vet=False, containers=False):
+    snapshot = board_report.collect(root) if snapshot is None else snapshot
+    rows = []
+    def path(name):
+        return root / name.lstrip('/')
+    def present(name):
+        try:
+            return 'yes' if path(name).is_file() else 'no'
+        except OSError:
+            return 'unknown'
+    def item(name, installed='unknown', configured='unknown', enabled='unknown',
+             runtime='unknown', tested='not-run', level='INFO', detail=''):
+        row = dict(component=name, installed=installed, configured=configured,
+                   enabled=enabled, runtime=runtime, tested=tested, level=level, detail=detail)
+        rows.append(row)
+        return row
+    release = snapshot.get('release', {})
+    kernel = snapshot.get('kernel', '')
+    expected = release.get('kernel_abi')
+    kernel_file = present('/boot/vmlinuz-' + kernel)
+    item('Kernel', kernel_file, runtime=kernel,
+         level='FAIL' if kernel_file == 'no' else 'OK' if expected == kernel else 'FAIL' if expected else 'WARN',
+         detail='Running ABI matches release' if expected == kernel else
+                'Running ABI differs from release or release metadata is unavailable')
+    try:
+        with path('/boot/config-' + kernel).open('rb') as stream:
+            raw_config = stream.read(1048577)
+        config = raw_config.decode('utf-8') if len(raw_config) <= 1048576 else None
+    except (OSError, UnicodeError):
+        config = None
+    def symbols(*names):
+        if config is None:
+            return 'unknown'
+        return 'yes' if all(re.search(r'^' + re.escape(n) + r'=[ym]$', config, re.M)
+                            for n in names) else 'no'
+    legacy = symbols('CONFIG_MALI400')
+    item('Legacy Mali400', enabled=legacy,
+         level='FAIL' if legacy == 'yes' else 'OK' if legacy == 'no' else 'WARN',
+         detail='Not a G610 driver; remove from the next kernel build, not by deleting Valhall files')
+    for name, names in (
+            ('NVMe driver', ('CONFIG_BLK_DEV_NVME',)),
+            ('HDMI drivers', ('CONFIG_DRM_ROCKCHIP', 'CONFIG_ROCKCHIP_VOP2')),
+            ('Audio codec driver', ('CONFIG_SND_SOC_ES8323',)),
+            ('USB audio driver', ('CONFIG_SND_USB_AUDIO',)),
+            ('NPU driver', ('CONFIG_ROCKCHIP_RKNPU',)),
+            ('GPU driver', ('CONFIG_DRM_PANTHOR',)),
+            ('GPIO character API', ('CONFIG_GPIO_CDEV',)),
+            ('SPI userspace API', ('CONFIG_SPI_SPIDEV',)),
+            ('I2C userspace API', ('CONFIG_I2C_CHARDEV',))):
+        enabled = symbols(*names)
+        item(name, enabled=enabled, level='FAIL' if enabled == 'no' else 'INFO',
+             detail='Kernel y/m capability; not proof of device-tree routing or a loaded driver')
+    for name, node in (('GPU device tree', 'gpu-panthor@fb000000'), ('NPU device tree', 'npu@fdab0000')):
+        directory = path('/sys/firmware/devicetree/base/' + node)
+        try:
+            directory.stat()
+            status = board_report.read_text(directory / 'status')
+            # A missing status property means enabled in the device tree.
+            enabled = 'yes' if status in ('ok', 'okay') or (status is None and not (directory / 'status').exists()) else 'no' if status is not None else 'unknown'
+        except OSError:
+            enabled = 'unknown'
+        item(name, enabled=enabled, level='FAIL' if enabled == 'no' else 'INFO',
+             detail='Live device-tree node; unknown if absent or unreadable')
+    thp = snapshot.get('metrics', {}).get('thp') or ''
+    selected_thp = re.search(r'\[([^\]]+)\]', thp)
+    item('Transparent huge pages', enabled=symbols('CONFIG_TRANSPARENT_HUGEPAGE'),
+         runtime=selected_thp[1] if selected_thp else 'unknown',
+         detail='Expected default madvise; current policy is read without changing it')
+    mount = snapshot.get('root_mount', {})
+    try:
+        source = json.loads(mount['stdout'])['filesystems'][0]['source']
+        nvme = isinstance(source, str) and source.startswith('/dev/nvme')
+        item('NVMe root', runtime='mounted' if nvme else 'other-device',
+             level='OK' if nvme else 'WARN', detail='Source is NVMe' if nvme else 'Root source is not an NVMe device path')
+    except (KeyError, ValueError, TypeError, IndexError):
+        item('NVMe root', level='WARN', detail='Mount query unavailable')
+
+    for unit, result in snapshot.get('services', {}).items():
+        properties = dict(line.split('=', 1) for line in result.get('stdout', '').splitlines() if '=' in line)
+        if result.get('returncode') != 0 or not properties:
+            item(unit, level='WARN', detail='systemd query unavailable; enablement and activity unknown')
+            continue
+        loaded = properties.get('LoadState', 'unknown')
+        active = properties.get('ActiveState', 'unknown')
+        sub = properties.get('SubState', 'unknown')
+        failure = active == 'failed' or properties.get('Result', 'success') not in ('success', '')
+        level = 'FAIL' if failure or loaded in ('not-found', 'masked', 'error') else 'OK' if active == 'active' else 'WARN'
+        if level == 'OK' and properties.get('UnitFileState') in ('disabled', 'masked', 'masked-runtime'):
+            level = 'WARN'
+        item(unit, installed='yes' if loaded == 'loaded' else 'no' if loaded == 'not-found' else 'unknown',
+             enabled=properties.get('UnitFileState') or 'unknown',
+             runtime=active + '/' + sub, level=level,
+             detail='Boot enablement and current activity are separate; restart count=' + properties.get('NRestarts', '?'))
+    provisioned = present('/var/lib/chatbox/provisioned')
+    item('First-boot marker', installed=provisioned, runtime='present' if provisioned == 'yes' else 'absent',
+         level='OK' if provisioned == 'yes' else 'WARN', detail='Marker only; does not verify credentials or expansion')
+
+    cards = snapshot.get('alsa_cards')
+    onboard = bool(cards and 'es8388' in cards.lower())
+    item('Onboard audio', runtime='registered' if onboard else 'not-observed',
+         level='OK' if onboard else 'WARN', detail='Capture, gain and speaker playback are untested')
+    drivers = snapshot.get('render_drivers', {})
+    npu = any(driver.casefold() == 'rknpu' for driver in drivers.values())
+    version = snapshot.get('rknpu_version')
+    mismatch = bool(version and not re.search(r'v?0\.9\.8\b', version))
+    item('NPU registration', runtime='registered' if npu else 'not-observed',
+         level='FAIL' if mismatch else 'OK' if npu else 'WARN',
+         detail='Expected 0.9.8 driver version observed' if version and not mismatch else
+                'Driver version differs from 0.9.8' if mismatch else 'Driver version unavailable; debugfs may not be mounted/readable')
+    devices = snapshot.get('devices', {})
+    gpu = any(driver.casefold() == 'panthor' for driver in drivers.values())
+    item('GPU device', runtime='present' if gpu else 'not-observed',
+         level='OK' if gpu else 'WARN', detail='Node presence does not prove firmware initialization or compute')
+    connectors = snapshot.get('display_connectors', {})
+    item('HDMI connection', runtime='connected' if 'connected' in connectors.values() else 'not-observed',
+         detail='Connector state only; visible output needs manual confirmation')
+    for name, file in (
+            ('GPU firmware copy', '/usr/lib/firmware/arm/mali/arch10.8/mali_csffw.bin'),
+            ('RKLLM runtime', '/usr/lib/aarch64-linux-gnu/librkllmrt.so'),
+            ('PanVK library', '/usr/lib/aarch64-linux-gnu/libvulkan_panfrost.so'),
+            ('OpenCL loader', '/usr/lib/aarch64-linux-gnu/libOpenCL.so.1'),
+            ('OpenCL checker', '/usr/local/sbin/chatbox-opencl-check')):
+        installed = present(file)
+        item(name, installed=installed, level='FAIL' if installed == 'no' else 'INFO',
+             detail='File presence only; dependencies and hardware execution untested')
+    icd = board_report.read_text(path('/etc/OpenCL/vendors/rusticl.icd'))
+    valid_icd = icd is not None and icd.strip() == 'libRusticlOpenCL.so.1'
+    cl = item('OpenCL GPU execution', configured='yes' if valid_icd else 'unknown' if icd is None else 'no',
+              level='WARN' if not valid_icd else 'INFO',
+              detail='Use --compute for a real numerical GPU test; default performs no computation')
+    if run_compute is not None:
+        result = run_compute()
+        cl.update(tested=result, level='OK' if result == 'pass' else 'FAIL',
+                  detail='This invocation only; does not verify a model workload')
+    vk = item('Vulkan GPU execution', installed=present('/usr/local/sbin/chatbox-vulkan-check'),
+              detail='Use --compute for a verified numerical shader test; presence is not execution')
+    if run_compute is not None:
+        result = compute_vulkan()
+        vk.update(tested=result, level='OK' if result=='pass' else 'FAIL')
+    regdb = present('/usr/lib/firmware/regulatory.db')
+    item('Wireless regulatory database', installed=regdb,
+         level='INFO' if regdb == 'yes' else 'WARN',
+         detail='Supports retained wireless drivers; no Wi-Fi module required or enabled')
+    boot = snapshot.get('boot_warnings', {})
+    if not boot.get('available'):
+        item('Boot warning scan', level='WARN', detail='Kernel warning buffer unavailable; run as root. Not an all-clear.')
+    else:
+        for name, count in boot.get('counts', {}).items():
+            if count:
+                item('Boot: ' + name, runtime=str(count) + ' occurrence(s)', level='WARN',
+                     detail='Observed in this boot; inspect dmesg. No raw kernel messages included in this report.')
+        if boot.get('limited'):
+            item('Boot warning scan', level='WARN', detail='Warning output truncated; scan is incomplete')
+
+    for name, prefix in (('GPIO devices', '/dev/gpiochip'), ('SPI devices', '/dev/spidev'), ('I2C devices', '/dev/i2c-')):
+        found = [v for k, v in devices.items() if k.startswith(prefix)]
+        item(name, runtime='present' if found else 'not-observed',
+             detail='Caller has read/write access to ' + str(sum(v.get('readable', False) and v.get('writable', False) for v in found)) +
+                    ' node(s); routing and pin conflicts untested')
+
+    configured = 'unknown'
+    try:
+        selected = load_config(path('/etc/chatbox/app.json')).backend
+        configured = 'yes' if selected is not None else 'no'
+        item('Backend configuration', configured=configured, level='INFO',
+             detail='Backend selected' if selected else 'Expected initial state: no model backend selected')
+    except (OSError, ValueError, TypeError):
+        item('Backend configuration', configured='no', level='FAIL', detail='Missing, unreadable or invalid configuration; contents suppressed')
+    health = query('/health')
+    live = health.get('http_status') == 200 and health.get('ok') is True
+    item('Coordinator API', runtime='live' if live else 'unavailable',
+         level='OK' if live else 'WARN', detail='Loopback GET /health only; no inference')
+    ready = query('/ready')
+    advertised = ready.get('http_status') == 200 and ready.get('ready') is True
+    state = 'advertised' if advertised else ready.get('state', 'unavailable')
+    if state not in ('advertised', 'loading', 'unconfigured', 'unknown', 'unavailable'):
+        state = 'unknown'
+    item('Model readiness', configured=configured, runtime=state,
+         level='INFO' if configured == 'no' else 'OK' if advertised else 'WARN',
+         detail='Model listing is not inference proof; no model inference is requested')
+    item('Voice/browser/button/OLED', installed='not-integrated', runtime='not-integrated',
+         detail='Not supplied by this source release; separately added applications are outside this inventory')
+    report = {'schema_version': 1, 'collected_utc': snapshot.get('collected_utc'),
+            'release': release.get('release', 'unknown'), 'checks': rows,
+            'failures': sum(r['level'] == 'FAIL' for r in rows),
+            'warnings': sum(r['level'] == 'WARN' for r in rows),
+            'metrics': snapshot.get('metrics', {}),
+            'acceptance': 'not_established',
+            'notes': ['Read-only inspection; no enable/disable, module load, mount, tuning, audio capture or inference.',
+                      'Unknown does not mean disabled. Built-in drivers do not need lsmod entries.',
+                      'Installed/enabled/registered does not mean functionally tested.']}
+    if vet:report['checks'].extend(vet_baseline(root,snapshot))
+    if vet or containers:report['checks'].extend(container_checks.checks(root,snapshot.get('kernel','')))
+    return finish(report,vet)
+
+
+def render(report):
+    lines = ['Chatbox ' + report['release'] + ' status',
+             f"{'Component':27} {'Installed':14} {'Enabled':12} {'Runtime':25} {'Tested':11} Result"]
+    for row in report['checks']:
+        lines.append(f"{row['component']:27} {row['installed']:14} {row['enabled']:12} {row['runtime']:25} {row['tested']:11} {row['level']}")
+        lines.append('  Configured: ' + row['configured'] + '. ' + row['detail'])
+    lines.append(f"\n{report['failures']} failure(s), {report['warnings']} warning(s). Hardware acceptance: not established.")
+    lines.extend(report['notes'])
+    lines.append('\nBaseline: '+report['baseline_state']+'; checker '+report['checker_revision'])
+    lines.append('Remaining acceptance tests:')
+    lines.extend('  - '+test for test in report['remaining_tests'])
+    return '\n'.join(lines)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--json', action='store_true', help='machine-readable report')
+    parser.add_argument('--containers', action='store_true', help='read-only live kernel/container capability checks; does not start Docker or run containers')
+    parser.add_argument('--vet', action='store_true', help='verify 2.0.1-gpu-experimental fixes, assets, expansion, hashes, all failed units and time sync (read only)')
+    parser.add_argument('--compute', action='store_true', help='also execute numerical OpenCL and Vulkan GPU tests (up to 65 seconds)')
+    args = parser.parse_args(argv)
+    report = collect(run_compute=compute if args.compute else None, vet=args.vet, containers=args.containers)
+    print(json.dumps(report, indent=2) if args.json else render(report))
+    return 1 if report['failures'] else 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

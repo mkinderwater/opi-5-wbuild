@@ -1,0 +1,3 @@
+# Compute access for future application users added to the render group.
+SUBSYSTEM=="misc", KERNEL=="mali*", GROUP="render", MODE="0660"
+SUBSYSTEM=="dma_heap", GROUP="render", MODE="0660"

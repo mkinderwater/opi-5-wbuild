@@ -1,0 +1,32 @@
+#!/bin/bash
+# No configuration file, password hash, private key or raw recording output.
+set -u
+printf 'Chatbox base diagnostics\n'
+cat /etc/chatbox/release.json
+uname -a
+printf '\nServices\n'
+systemctl --failed --no-pager
+systemctl status chatbox-firstboot chatbox-readiness --no-pager || true
+printf '\nEthernet\n'
+networkctl --no-pager status --all
+printf '\nStorage\n'
+findmnt /
+lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINTS
+printf '\nInterfaces\n'
+find /dev -maxdepth 1 \( -name 'gpiochip*' -o -name 'spidev*' -o -name 'i2c-*' \) -print
+printf '\nDisplay\n'
+ls -l /dev/dri /sys/class/drm 2>/dev/null || true
+dmesg | grep -Ei 'drm|hdmi|vop|display|edid' | tail -80 || true
+printf '\nAudio\n'
+cat /proc/asound/cards 2>/dev/null || true
+printf '\nProvisioning\n'
+journalctl -b -u chatbox-firstboot --no-pager -n 80
+
+printf '\nHardware support\n'
+chatbox-hardware-check || true
+dmesg | grep -Ei 'rknpu|es8388|es8323|asoc|i2s' | tail -80 || true
+
+printf '\nLocal coordinator\n'
+systemctl status chatbox-app --no-pager || true
+printf '\nClocks and thermals (read only)\n'
+/usr/bin/python3 /usr/local/sbin/chatbox-metrics || true

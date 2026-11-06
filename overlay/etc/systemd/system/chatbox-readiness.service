@@ -1,0 +1,17 @@
+[Unit]
+Description=Verify Chatbox Ethernet and SSH readiness
+Requires=chatbox-firstboot.service
+Wants=ssh.service
+After=chatbox-firstboot.service ssh.service systemd-networkd.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/chatbox-readiness
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=110
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

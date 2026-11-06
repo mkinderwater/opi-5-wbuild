@@ -1,0 +1,34 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Fcntl qw(O_WRONLY O_CREAT O_EXCL);
+my ($path, $out) = @ARGV;
+die "usage: chatbox-config CONFIG PRIVATE_OUTPUT_DIR\n" unless defined($out) && -d $out;
+open(my $fh, '<', $path) or die "Cannot read configuration\n";
+my %cfg;
+my %allowed = map { $_ => 1 } qw(ROOT_PASSWORD TIMEZONE HOSTNAME);
+while (my $line = <$fh>) {
+    $line =~ s/\r?\n\z//;
+    next if $line =~ /^\s*(#|$)/;
+    $line =~ /^([A-Z_]+)=(.*)$/ or die "Malformed configuration line\n";
+    my ($key,$value) = ($1,$2);
+    die "Unknown configuration key: $key\n" unless $allowed{$key};
+    die "Duplicate configuration key: $key\n" if exists $cfg{$key};
+    $cfg{$key}=$value;
+}
+close($fh);
+my $password = $cfg{ROOT_PASSWORD} // '';
+die "ROOT_PASSWORD must not be empty or contain control characters\n"
+    unless length($password) && $password !~ /[\x00-\x1f\x7f]/;
+my $tz = $cfg{TIMEZONE} || 'America/Edmonton';
+die "Invalid timezone\n" unless $tz =~ /^[A-Za-z0-9_+\/-]+$/ && $tz !~ /\.\./ && $tz !~ /^\//;
+my $name = $cfg{HOSTNAME} // '';
+die "Invalid hostname\n" if length($name) && ($name !~ /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/);
+my %files = (chpasswd => "root:$password\n", timezone => "$tz\n", hostname => "$name\n");
+for my $file (sort keys %files) {
+    my $dest="$out/$file";
+    unlink($dest) if -e $dest;
+    sysopen(my $output,$dest,O_WRONLY|O_CREAT|O_EXCL,0600) or die "Cannot create private provisioning file\n";
+    print $output $files{$file};
+    close($output) or die "Cannot commit provisioning file\n";
+}

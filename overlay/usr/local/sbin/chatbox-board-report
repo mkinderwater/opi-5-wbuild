@@ -1,0 +1,8 @@
+#!/usr/bin/python3
+import json
+import sys
+
+sys.path.insert(0, '/usr/local/lib/chatbox')
+from board_report import collect
+
+print(json.dumps(collect(), indent=2))

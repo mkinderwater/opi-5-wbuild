@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+// Local corrections to the pinned original Orange Pi 5 board definition.
+
+&leds_gpio {
+    // Match gpio-leds/led@1: <&gpio1 RK_PA2 GPIO_ACTIVE_HIGH>.
+    // GPIO0_A2 belongs to the RK806 PMIC SPI connection, not this LED.
+    rockchip,pins = <1 RK_PA2 RK_FUNC_GPIO &pcfg_pull_none>;
+};
+
+// Use the source tree's existing Panthor node and voltage/clock definitions.
+&gpu { status = "disabled"; };
+&gpu_panthor { status = "okay"; mali-supply = <&vdd_gpu_s0>; };
+&{/thermal-zones/soc-thermal/cooling-maps/map3} {
+    cooling-device = <&gpu_panthor THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+};

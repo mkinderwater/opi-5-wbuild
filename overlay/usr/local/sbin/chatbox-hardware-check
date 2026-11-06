@@ -1,0 +1,42 @@
+#!/bin/bash
+# Reports registration and dependency checks. Does not claim an inference test.
+set -u
+failed=0
+printf 'Kernel: '; uname -r
+printf '\nALSA cards and PCM devices\n'
+cat /proc/asound/cards 2>/dev/null || true
+aplay -l || failed=1
+arecord -l || failed=1
+if ! grep -qi 'es8388' /proc/asound/cards 2>/dev/null; then
+    echo 'FAIL: onboard ES8388 ALSA card has not registered'; failed=1
+fi
+printf '\nRKNPU driver\n'
+version=/sys/kernel/debug/rknpu/version
+if [ ! -r "$version" ]; then
+    echo 'RKNPU version unavailable. As root: mount -t debugfs debugfs /sys/kernel/debug'
+    failed=1
+elif ! grep -q 'v0\.9\.8' "$version"; then
+    cat "$version"; echo 'FAIL: expected RKNPU 0.9.8'; failed=1
+else
+    cat "$version"
+fi
+found=0
+for render in /sys/class/drm/renderD*; do
+    [ -e "$render" ] || continue
+    driver=$(readlink -f "$render/device/driver" 2>/dev/null || true)
+    name=${driver##*/}
+    if [ "${name,,}" = rknpu ]; then
+        node="/dev/dri/${render##*/}"
+        printf 'NPU device: %s\n' "$node"
+        [ -c "$node" ] && found=1
+    fi
+done
+if [ "$found" -ne 1 ]; then echo 'FAIL: no RKNPU render device'; failed=1; fi
+printf '\nRKLLM shared-library dependencies\n'
+/lib/ld-linux-aarch64.so.1 --list /usr/lib/aarch64-linux-gnu/librkllmrt.so || failed=1
+printf '\nOpenCL GPU compute test\n'
+timeout 60 /usr/local/sbin/chatbox-opencl-check || failed=1
+printf '\nVulkan GPU compute test\n'
+timeout 60 /usr/local/sbin/chatbox-vulkan-check || failed=1
+printf '\nAudio/NPU registration checks only. A matching RKLLM model inference and microphone recording/playback are still required.\n'
+exit "$failed"

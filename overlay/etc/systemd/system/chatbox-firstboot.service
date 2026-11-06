@@ -1,0 +1,13 @@
+[Unit]
+Description=Chatbox identity, credentials and NVMe provisioning
+After=local-fs.target systemd-udev-trigger.service
+Before=ssh.service ssh.socket
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/chatbox-firstboot
+TimeoutStartSec=360
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

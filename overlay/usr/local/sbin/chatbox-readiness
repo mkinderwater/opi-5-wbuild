@@ -1,0 +1,26 @@
+#!/bin/bash
+set -euo pipefail
+# shellcheck source=/dev/null
+source /usr/local/lib/chatbox/network.sh
+STATE=/var/lib/chatbox
+mkdir -p "$STATE" /etc/issue.d
+[ -f "$STATE/provisioned" ] || { echo 'Credentials are not provisioned'; exit 1; }
+printf 'READY=false\n' >"$STATE/readiness"
+result=''
+for ((attempt=0; attempt<90; attempt++)); do
+    result=$(ethernet_address) && break
+    sleep 1
+done
+if [ -z "$result" ]; then
+    echo 'Ethernet has no usable IPv4 address; readiness will retry.'
+    networkctl --no-pager status --all || true
+    exit 1
+fi
+read -r interface address <<<"$result"
+systemctl is-active --quiet ssh.service || { echo 'SSH is not active'; exit 1; }
+# Only report ready after both checks pass. agetty expands the address per login.
+mac=$(cat "/sys/class/net/$interface/address")
+printf 'Ethernet: %s  MAC: %s  IPv4: \\4{%s}\n' "$interface" "$mac" "$interface" >/etc/issue.d/90-chatbox-network.issue
+printf 'INTERFACE=%s\nIPV4=%s\nSSH=active\n' "$interface" "$address" >"$STATE/readiness.new"
+mv -f "$STATE/readiness.new" "$STATE/readiness"
+printf 'Chatbox ready. SSH: root@%s\n' "$address"

@@ -1,0 +1,23 @@
+#!/bin/sh
+set -eu
+case "${1:-}" in prereqs) exit 0;; esac
+. /usr/share/initramfs-tools/hook-functions
+# cfg80211 is built in and can request this before the NVMe root is mounted.
+# Resolve Debian's alternatives now, so the initramfs needs no alternatives tree.
+for name in regulatory.db regulatory.db.p7s; do
+    source_file=$(readlink -f "/usr/lib/firmware/$name") || continue
+    [ -r "$source_file" ] || continue
+    if copy_file firmware "$source_file" "/usr/lib/firmware/$name"; then
+        :
+    else
+        result=$?
+        # Debian's helper returns 1 for an existing destination, not an I/O
+        # failure. Accept it only when it is the same firmware, never blindly.
+        [ "$result" -eq 1 ] || exit "$result"
+        if ! cmp -s "$source_file" "$DESTDIR/usr/lib/firmware/$name"; then
+            echo "E: existing initramfs $name differs from its source" >&2
+            exit 1
+        fi
+    fi
+done
+exit 0

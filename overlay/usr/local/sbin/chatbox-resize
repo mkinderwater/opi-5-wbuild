@@ -1,0 +1,27 @@
+#!/bin/bash
+set -euo pipefail
+STATE=/var/lib/chatbox
+mkdir -p "$STATE"
+[ ! -e "$STATE/root-expanded" ] || exit 0
+root_id=$(sed -n 's/^ROOT_PARTUUID=//p' /etc/chatbox/platform.conf)
+[[ "$root_id" =~ ^[0-9a-f]{8}-02$ ]] || exit 1
+expected=$(readlink -f "/dev/disk/by-partuuid/$root_id")
+actual=$(findmnt -n -o SOURCE /)
+actual=$(readlink -f "$actual")
+[ "$actual" = "$expected" ] || { echo 'Root device identity mismatch'; exit 1; }
+part=$(lsblk -dnro PARTN "$actual")
+parent=$(lsblk -dnro PKNAME "$actual")
+[ "$part" = 2 ] || { echo 'Expected root partition 2'; exit 1; }
+[[ "$parent" =~ ^nvme[0-9]+n[0-9]+$ ]] || { echo 'Root expansion requires a native NVMe disk'; exit 1; }
+disk="/dev/$parent"
+sectors=$(blockdev --getsz "$disk")
+start=$(cat "/sys/class/block/$(basename "$actual")/start")
+# Validate both partition entries, disk signature, geometry, and block size.
+[ "$(blockdev --getss "$disk")" = 512 ] || { echo '512-byte logical sectors required'; exit 1; }
+perl /usr/local/lib/chatbox/grow-mbr.pl "$disk" "$sectors" "$start" "${root_id%-02}"
+sync
+timeout 20 partx --update --nr 2 "$disk"
+[ "$(blockdev --getsz "$actual")" = "$((sectors-start))" ] || exit 1
+timeout --kill-after=10 180 resize2fs "$actual"
+touch "$STATE/root-expanded"
+sync
