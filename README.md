@@ -4,7 +4,7 @@ A reproducible, source-only image builder for the **Orange Pi 5 (RK3588S, 8 GB)*
 
 The build runs entirely on Windows through Debian WSL2. Every downloaded input is pinned by hash, every build starts from a fresh workspace, and the finished image boots straight to Ethernet and SSH with no on-device compiling or setup reboots.
 
-> **Status: experimental.** This release swaps the proprietary Mali (Valhall/libmali) GPU stack used in 1.9.0 for the open Panthor/Mesa stack. Host tests pass, but the full image has not yet been validated on hardware. Flash it to a **separate test NVMe** and keep a known-good drive as your rollback.
+> **Status: experimental, running on real hardware.** This release swaps the proprietary Mali (Valhall/libmali) GPU stack used in 1.9.0 for the open Panthor/Mesa stack. 2.0.1 (`6.1.172-chatbox8-arm64`) has booted on an Orange Pi 5 8 GB and was the platform underneath the accepted voice assistant tests. Numeric OpenCL and Vulkan checks and Docker functionality passed in a later on-board audit. Full acceptance (all five gates below, including sustained thermal testing) is **not** complete. See [Real-world test results](#real-world-test-results).
 
 ---
 
@@ -146,9 +146,267 @@ Promotion of this image beyond experimental follows the gates in [`docs/ACCEPTAN
 
 A simple numeric pass shows the GPU works. It does not prove that a given application (MLC-LLM, whisper.cpp) has every Vulkan or OpenCL feature it needs, such as fp16 or subgroup support.
 
-## Rollback
+### Acceptance progress
 
-Rollback is a drive swap: power off and reinstall your known-good NVMe. Do not mix the kernel, DTB, firmware or libmali files between 1.9.0 and 2.0.1 images. The Debian recovery kernel is also available on the image via `chatbox-select-kernel recovery`.
+| Gate | Status on real hardware |
+| --- | --- |
+| 1. Boot and registration | Booted and used as the running platform (`chatbox8` kernel, NVMe root expanded to about 235 GB, ES8388 audio working). Some NPU, regulator/OPP, OP-TEE and SCMI boot warnings remain. |
+| 2. Both GPU APIs | Numeric OpenCL and Vulkan checks passed. Vulkan reports FP16; BF16 and matrix cores are not reported. OpenCL FP16 is not separately established. |
+| 3. NPU and audio preserved | Real RKLLM generation on the NPU confirmed. Docker and Open WebUI ran. Microphone capture and headphone playback working. |
+| 4. Application acceleration | Vulkan tested with Piper TTS only (slower than CPU, see below). whisper.cpp Vulkan and MLC on Rusticl not yet tested. |
+| 5. Sustained operation | Not done. No temperature, power or long-run data yet. |
+
+## Real-world test results
+
+These results come from hands-on testing on an original Orange Pi 5 (RK3588S, 8 GB) running this 2.0.1 image, recorded in the November 6, 2026 community test report. They are measurements of particular runs, not performance guarantees. **Cooling, ambient temperature and power were not recorded for these captures.** Run IDs are the Pi's own benchmark directory names; their timezone was not recorded.
+
+### Test platform
+
+| Item | Value |
+| --- | --- |
+| Board / RAM | Original Orange Pi 5, 8 GB |
+| SoC | Rockchip RK3588S: 4x Cortex-A76 (cores 4-7), 4x Cortex-A55 (cores 0-3) |
+| GPU | Mali-G610 MC4, Panthor + Mesa 26.1.6 PanVK/Rusticl |
+| NPU | RKNPU 0.9.8 driver, RKLLM 1.2.3 runtime, 3 NPU cores |
+| Kernel | `6.1.172-chatbox8-arm64` (Chatbox 2.0.1) |
+| Storage | NVMe, root `/dev/nvme0n1p2`, about 235 GB after expansion |
+| Audio | Onboard ES8388 codec, headphone out and onboard mic |
+| CPU governor | `schedutil` (image default) unless stated |
+| Cooling | Not recorded for the timing captures |
+
+### Software under test
+
+| Work | Engine | Pin | Runs on |
+| --- | --- | --- | --- |
+| Chat | Qwen2.5 1.5B Instruct W8A8, RKLLM | model SHA-256 `060ea964...b64b2e` | NPU |
+| Chat HTTP API | GatekeeperZA RKLLM-API-Server, project-adapted | `89f43f9` | CPU |
+| Speech recognition | whisper.cpp v1.9.5, `tiny.en`, 4 threads | `d1be6fd` | CPU |
+| Speech synthesis | audio.cpp v0.9.3, Piper en-US Lessac Medium GGUF, 4 threads | `41c1f8f` | CPU (Vulkan tested) |
+| Browser UI | Open WebUI v0.12.5, Docker, 2 GiB memory limit | pinned digest | CPU |
+| Document embeddings | all-MiniLM-L6-v2, batch 1 | `1110a24` | CPU |
+
+### Measurement definitions
+
+| Term | Meaning |
+| --- | --- |
+| First text | Client-observed arrival of the first generated text, not answer completion |
+| WAV ready | Synthesis finished, including the overhead stated for that test |
+| First player | Software playback process launched; not an acoustic measurement of first audible sample |
+| RTF | Real-time factor: synthesis time divided by audio duration. Below 1.0 is faster than real time |
+| NPU completion | Total time for the whole answer. Output lengths differ, so this is not a tokens/s benchmark |
+| System CPU % | All 8 cores together = 100% |
+| Process CPU % | One core = 100%, so multithreaded engines exceed 100% |
+| System RAM | MemTotal minus MemAvailable, sampled every 250 ms |
+
+All times are milliseconds unless noted. Medians only; no p95 figures were recorded.
+
+### 1. NPU chat latency
+
+| Capture | First text | Notes |
+| --- | ---: | --- |
+| Accepted typed voice run | 262.1 | Bypasses Whisper |
+| Accepted microphone voice run | 233.7 | Full voice pipeline |
+| Resource-reported voice turn A | 221.7 | 32 prompt / 83 output tokens |
+| Resource-reported voice turn B | 636.7 | 134 prompt / 255 output tokens |
+| Historical custom backend 0.2.2, short prompts | about 240 to 340 | Earlier project record |
+| Historical stock RKLLama | about 740 to 820 | Not a matched rerun |
+
+Longer prompts increase time to first text (turn B had about 4x the prompt tokens of turn A). The gap between the custom backend and stock RKLLama is mostly wrapper, prompt and history handling, not faster NPU decoding; the individual causes were not isolated.
+
+### 2. Standalone Piper TTS: CPU versus Vulkan
+
+Run `tts-runs/20261103-222700-2538`. One discarded warmup per backend, then 3 trials in alternating order. Each trial started a new process and loaded the model, so these include load time.
+
+| Backend | Median WAV ready (incl. process + model load) | RTF |
+| --- | ---: | ---: |
+| CPU, 4 threads | 1223.1 | 0.282 |
+| Vulkan, Mali-G610 | 4082.0 | 0.940 |
+
+CPU was **3.34x faster**. In the Vulkan build only the Piper decoder ran on the GPU; the duration components stayed on CPU. Both backends produced correct, playable audio.
+
+### 3. Resident overlap: Whisper + Piper + NPU together
+
+Run `overlap-runs/20261103-233353-2885`. Speech workers resident and warmed, 5 measured rounds per backend, alternating order. Fixed fixtures reused within the run (synthetic overlap, not live mic capture during playback):
+
+- **Whisper input:** 16 kHz PCM16 WAV, "What time does the library open tomorrow morning?"
+- **TTS text:** "Hello. This is the Orange Pi speech test. The headphone output is working."
+- **NPU prompt:** describe how a library helps a community in about eighty words.
+
+| TTS backend | Stage | Whisper | TTS | NPU completion | TTS RTF |
+| --- | --- | ---: | ---: | ---: | ---: |
+| CPU | Whisper alone | 867.3 | | | |
+| CPU | TTS alone | | 1058.8 | | 0.244 |
+| CPU | Whisper + TTS | 1435.3 | 1624.4 | | 0.374 |
+| CPU | NPU alone | | | 16788.2 | |
+| CPU | Whisper + TTS + NPU | 2371.3 | 2778.9 | 15710.1 | 0.640 |
+| Vulkan | Whisper alone | 876.5 | | | |
+| Vulkan | TTS alone | | 3150.6 | | 0.726 |
+| Vulkan | Whisper + TTS | 1121.6 | 3212.8 | | 0.740 |
+| Vulkan | NPU alone | | | 16944.4 | |
+| Vulkan | Whisper + TTS + NPU | 1615.0 | 4435.8 | 17759.3 | 1.022 |
+
+Findings:
+
+- **Contention cost on CPU:** running Whisper and CPU TTS together made Whisper 65% slower (867 to 1435) and TTS 53% slower (1059 to 1624). Adding the NPU on top raised both again, because tokenization, HTTP and streaming still use CPU.
+- **Vulkan trade-off under full load:** Whisper 32% faster (2371 to 1615), TTS 60% slower (2779 to 4436), RTF 1.022, slightly slower than real time. CPU TTS keeps more playback margin.
+- **Resident versus cold:** resident CPU TTS alone (1058.8) is only slightly faster than the cold-process figure (1223.1). Resident Vulkan TTS alone (3150.6) saves about 930 ms over cold, so GPU initialization is a large part of Vulkan's cold cost.
+- NPU completion stays between 15.7 and 17.8 s throughout. Output lengths differ, so these totals do not rank NPU decoding speed.
+
+### 4. CPU core placement
+
+Earlier attempts using `taskset` and live affinity changes did not hold (threads later appeared allowed on all 8 cores), so those runs were discarded. The valid runner used temporary systemd services with cgroup v2 `AllowedCPUs`, tried to widen its own affinity, and confirmed the kernel kept the assigned cpuset. Each stage recorded MainPID, thread masks and cgroup membership. Limits were not exclusive reservations against other processes.
+
+Run `affinity-runs/20261104-064601-20513`, 5 rounds, layouts rotated and stage order reversed on alternate rounds. Both speech engines used 4 threads and were warmed. The NPU service kept its own scheduling.
+
+| Layout | Stage | Whisper | TTS | NPU completion | TTS RTF |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Shared pool | Whisper alone | 912.3 | | | |
+| Shared pool | TTS alone | | 973.7 | | 0.224 |
+| Shared pool | Whisper + TTS | 1384.3 | 1540.7 | | 0.355 |
+| Shared pool | NPU alone | | | 16780.3 | |
+| Shared pool | Whisper + TTS + NPU | 2027.1 | 2602.9 | 16115.1 | 0.599 |
+| Whisper on A76 (4-7), Piper on A55 (0-3) | Whisper alone | 880.3 | | | |
+| | TTS alone | | 3729.9 | | 0.859 |
+| | Whisper + TTS | 860.4 | 3721.4 | | 0.857 |
+| | NPU alone | | | 16901.7 | |
+| | Whisper + TTS + NPU | 1503.1 | 3969.3 | 15531.7 | 0.914 |
+| Piper on A76 (4-7), Whisper on A55 (0-3) | Whisper alone | 3274.9 | | | |
+| | TTS alone | | 911.3 | | 0.210 |
+| | Whisper + TTS | 3344.1 | 894.6 | | 0.206 |
+| | NPU alone | | | 16239.6 | |
+| | Whisper + TTS + NPU | 3621.0 | 2059.5 | 15198.9 | 0.474 |
+
+Findings:
+
+- **A76 versus A55 single-engine cost:** Whisper takes about 3.7x longer on the A55 cluster (880 vs 3275); Piper about 4.1x longer (911 vs 3730).
+- **Isolation works when not contended:** with split clusters, Whisper + TTS together are no slower than each alone, unlike the shared pool.
+- **Under full load:** Whisper-fast improved ASR by 26% but TTS was 52% slower. TTS-fast improved TTS by 21% but ASR was 79% slower.
+- **Shared pool is the default.** It gave the best combined result. Other thread counts, partial A76 splits and priority policies were not tested.
+
+### 5. Clock and governor state
+
+Snapshot of the image's defaults during testing:
+
+| Device / policy | Governor | Allowed range | Observed |
+| --- | --- | --- | --- |
+| CPU policy0 (cores 0-3, A55) | schedutil | 1.2 to 1.8 GHz | |
+| CPU policy4 (cores 4-5, A76) | schedutil | 0.408 to 2.304 GHz | |
+| CPU policy6 (cores 6-7, A76) | schedutil | 0.408 to 2.304 GHz | |
+| DMC (memory) | dmc_ondemand | 528 to 2112 MHz | 528 MHz |
+| GPU | simple_ondemand | 200 to 1000 MHz | 200 MHz |
+| NPU | rknpu_ondemand | 300 to 1000 MHz | 1000 MHz |
+
+These are point-in-time snapshots, not proof of sustained clocks or absence of throttling.
+
+**Exploratory CPU `performance` governor test** (CPU policies only; prompts and output lengths not identical):
+
+| Metric | schedutil | performance |
+| --- | ---: | ---: |
+| Whisper transcription | 837.0 | 767.0 |
+| AI first text | 230.1 | 150.1 |
+| AI last text arrival | 22405.0 | 15077.8 |
+| Client-observed decode tokens/s | 9.02 | 12.93 |
+| First player after input | 6904 | 4779 |
+| First chunk synthesis | 2994.5 | 2474.3 |
+| First chunk audio (s) | 6.153 | 5.584 |
+| Prompt / output / total tokens | 27 / 201 / 228 | 27 / 194 / 221 |
+| Peak system RAM (MiB) | 4102.6 | 4212.9 |
+| Peak NPU load per core % | 79 | 86 |
+
+The tokens/s figure combines client-side text arrival with API token counts and can be affected by streaming backpressure; it is not native NPU decode speed. The large decode change suggests CPU-side work (sampling, tokenization, streaming) limits the NPU pipeline under `schedutil`, but this was not a controlled test. **This image does not change any governor.** Without a heatsink, a short-run gain does not show that maximum clocks are sustainable.
+
+### 6. End-to-end spoken interaction
+
+Sentence-based streaming: each finished sentence is synthesized while earlier audio plays.
+
+| Run | Input | AI first text | First player after input | Speech chunks | Synthesis overlapped playback |
+| --- | --- | ---: | ---: | ---: | --- |
+| `20261104-071901-23279` | Typed question about the Orange Pi | 262.1 | 7319 | 3 | Yes |
+| `20261104-071944-23331` | Microphone question about Christmas | 233.7 | 1791 | 14 | Yes |
+
+For the microphone run, timing starts when recording stops, so the 1.8 s includes Whisper, the first answer sentence and its synthesis. The typed run's long first sentence likely explains its 7.3 s delay (inferred from reply shape, not a per-stage measurement). The tester confirmed complete speech and acceptable pauses. Capture is limited to 30 s per turn; there is no echo cancellation, wake word or barge-in.
+
+### 7. Resource use per voice turn
+
+| Question (as transcribed) | First text | First player | System CPU mean / peak % | Peak RAM (MiB) | NPU core 0 / 1 / 2 mean % | NPU peak per core % | Tokens prompt / output / total |
+| --- | ---: | ---: | --- | ---: | --- | ---: | --- |
+| Purpose of a generous break | 221.7 | 5629 | 15.37 / 55.72 | 4006.3 | 13.42 / 13.45 / 13.57 | 75 | 32 / 83 / 115 |
+| Purpose of an NVME | 636.7 | 10916 | 18.10 / 58.50 | 4137.7 | 15.06 / 15.09 / 15.31 | 79 | 134 / 255 / 389 |
+
+- Whisper and Piper each reached about 400% process CPU (4 full cores) during their stages.
+- NPU load is spread evenly over all three cores. Means include recording and playback time, so they understate load during generation.
+- Peak system RAM across all captured voice runs: **4006 to 4213 MiB** of 8 GB with the NPU model, Whisper, Piper and Open WebUI loaded.
+- 250 ms sampling can miss short peaks. RSS sums double-count shared pages and miss accelerator allocations.
+
+### 8. Model sizes
+
+| Model | RKLLM file size | Status |
+| --- | ---: | --- |
+| Qwen2.5 1.5B Instruct W8A8 | 2,055,447,460 bytes (1.91 GiB) | Accepted baseline |
+| Qwen2.5 3B Instruct W8A8 | 3,755,461,260 bytes (3.50 GiB) | Trialled; returned to 1.5B |
+
+File size is not loaded RAM; KV cache, runtime buffers, tokenizer and the rest of the stack add to it. No controlled 1.5B versus 3B quality, RAM, heat or speed comparison was made.
+
+### 9. Audio settings that worked
+
+- **Capture:** `plughw:CARD=rockchipes8388,DEV=0`, stereo PCM16 at 16 kHz, channel 0 converted to mono for Whisper. Main Mic on, capture unmuted, both capture PGAs set absolutely to +18 dB with readback (repeated starts do not stack gain). No software gain. These are not applied automatically by the image.
+- **Playback:** the codec accepts 48 kHz stereo PCM16. Direct 22.05 kHz mono Piper output fails with `Unable to install hw params`. An application-local ALSA `plug` device (selected with `ALSA_CONFIG_PATH`) resamples and upmixes without touching the global config:
+
+  ```text
+  </usr/share/alsa/alsa.conf>
+  pcm.chatbox_tts {
+      type plug
+      slave {
+          pcm "hw:CARD=rockchipes8388,DEV=0"
+          format S16_LE
+          rate 48000
+          channels 2
+      }
+  }
+  ```
+
+### 10. GPU feature notes
+
+- Numeric OpenCL (Rusticl) and Vulkan (PanVK) checks passed on the Mali-G610.
+- Vulkan device properties report **FP16**. BF16 and matrix/cooperative cores are not reported. OpenCL FP16 was not separately established.
+- Rusticl only exposes the GPU with `RUSTICL_ENABLE=panfrost`. Login shells get it; systemd services and containers must set it themselves.
+- Passing enumeration and numeric checks does not mean an application uses the GPU or speeds up. Piper on Vulkan is the only workload measured so far, and it was slower.
+
+### 11. Lessons from building on the board
+
+- A large native build (audio.cpp Vulkan shaders) stalled the Pi and froze another SSH session; a power cycle was needed. Resource pressure is suspected; no OOM or thermal log confirmed it. This recovery worked:
+
+  ```sh
+  docker stop chatbox-webui
+  systemctl stop chatbox-npu-http
+  cmake --build <build-dir> --target audiocpp_cli --parallel 1
+  ```
+
+  Then restart the services. Build serially on the 8 GB board while AI services are stopped.
+- Docker needs kernel options this image enables explicitly (overlayfs, namespaces, seccomp, cgroups/memory/pids/cpusets, BPF, NAT). Check the live kernel with `chatbox-status --containers`.
+- `curl` is not installed; use Python's standard library for HTTP health checks. A 200 health response is not proof the model generates output.
+- Some NPU, regulator/OPP, OP-TEE and SCMI boot warnings remain in the kernel log. Inference works regardless, but the warnings are not resolved.
+
+### 12. What has not been measured
+
+| Item | Status |
+| --- | --- |
+| Idle or loaded SoC temperature | Not recorded |
+| Thermal equilibrium time | Not measured |
+| Thermal throttling | Not established |
+| Board or wall power | Not measured |
+| Heat-related crash or shutdown | None established |
+| whisper.cpp on Vulkan | Not tested |
+| MLC-LLM on Rusticl | Not tested |
+| Long sessions, memory pressure, repeated reboots | Not tested |
+
+Missing measurements are missing, not zero. The full report includes a read-only telemetry collector (thermal zones, trip points, cooling states, CPU/devfreq clocks, memory, NPU load) and a step-by-step no-heatsink measurement protocol for anyone who wants to contribute thermal data.
+
+The full report, with methods, qualifications and the telemetry script, is in [`docs/COMMUNITY-TEST-REPORT-2026-11-06.md`](docs/COMMUNITY-TEST-REPORT-2026-11-06.md).
+
+## Recovery kernel
+
+A stock Debian `6.12.113+deb13-arm64` kernel and DTB are included on the image. Select it for the next boot with `chatbox-select-kernel recovery`, and return with `chatbox-select-kernel display`. Do not mix kernel, DTB, firmware or libmali files from 1.9.0 images into this one.
 
 ## Compatibility notes
 
@@ -193,8 +451,9 @@ Some tests skip when a tool they need (for example a software Vulkan ICD) is una
 
 - [`docs/BUILD-AND-PINS.md`](docs/BUILD-AND-PINS.md): how inputs are selected and pinned
 - [`docs/BASELINE-AUDIT.md`](docs/BASELINE-AUDIT.md): what changed from 1.9.0 and why
-- [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md): hardware acceptance gates and rollback
+- [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md): hardware acceptance gates
 - [`docs/LOCAL-VERIFICATION.md`](docs/LOCAL-VERIFICATION.md): verification performed and its limits
+- [`docs/COMMUNITY-TEST-REPORT-2026-11-06.md`](docs/COMMUNITY-TEST-REPORT-2026-11-06.md): real hardware benchmarks, failures and thermal test protocol
 
 ## Third-party components
 
@@ -209,8 +468,12 @@ Each component remains under its own license. Debian package licences are instal
 
 ## License
 
-<!-- Add your chosen license here, e.g. MIT or GPL-2.0, and include a LICENSE file. -->
+The Chatbox build scripts, overlay files, tools and documentation in this repository are released under the [MIT License](LICENSE).
 
-## Author
+The MIT License covers only this project's own work. Components downloaded at build time (kernel, Debian packages, Mesa, firmware, RKLLM and any models) keep their own licenses.
 
-Matthew Kinderwater, ICUBEDEV CGY ([icubedev.com](https://icubedev.com)), Calgary, Alberta.
+## Credits
+
+Hands-on testing, project direction and integration: **Matthew Kinderwater**, ICUBEDEV CGY ([icubedev.com](https://icubedev.com)), Calgary, Alberta. AI assistance was used in code iteration and report preparation.
+
+The engines, models, drivers and UI used in testing remain the work of their authors: Orange Pi and Rockchip, Linux and Armbian, Mesa, Rockchip rknn-llm, the GatekeeperZA RKLLM model conversion and API server, Qwen, whisper.cpp and OpenAI Whisper, audio.cpp and Piper voice authors, Open WebUI, Sentence Transformers and spaCy. This project assembles, configures, tests and diagnoses them.
